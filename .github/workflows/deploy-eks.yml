@@ -1,0 +1,139 @@
+name: Despliegue EKS - Estrategias de Rollout
+
+on:
+  workflow_dispatch:
+    inputs:
+      strategy:
+        description: 'Estrategia (rolling-update | recreate | blue-green | canary)'
+        required: true
+        default: 'rolling-update'
+      cluster_name:
+        description: 'Nombre del cluster EKS'
+        required: true
+        default: 'duoc-eks-cluster-cli'
+      aws_region:
+        description: 'Región AWS'
+        required: true
+        default: 'us-east-1'
+
+env:
+  ECR_REPO: duoc-eks-app
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. Checkout del código
+        uses: actions/checkout@v4
+
+      - name: 2. Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ github.event.inputs.aws_region }}
+
+      - name: 3. Conectar a EKS (kubeconfig)
+        run: |
+          aws eks update-kubeconfig \
+            --name ${{ github.event.inputs.cluster_name }} \
+            --region ${{ github.event.inputs.aws_region }}
+          kubectl get nodes
+
+      - name: 4. Preparar variables de imagen
+        run: |
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          REGION=${{ github.event.inputs.aws_region }}
+          echo "IMAGE_V1=${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO}:v1" >> $GITHUB_ENV
+          echo "IMAGE_V2=${ACCOUNT}.dkr.ecr.${REGION}.amazonaws.com/${ECR_REPO}:v2" >> $GITHUB_ENV
+
+      - name: Rolling Update
+        if: ${{ github.event.inputs.strategy == 'rolling-update' }}
+        run: |
+          echo "=== Aplicando V1 (estado inicial) ==="
+          sed "s|IMAGE_PLACEHOLDER|${IMAGE_V1}|g" k8s/rolling-update/deployment.yaml | kubectl apply -f -
+          kubectl apply -f k8s/rolling-update/service.yaml
+          kubectl rollout status deployment/app-rolling --timeout=120s
+
+          echo "=== Actualizando a V2 (rolling update) ==="
+          T0=$(date +%s)
+          sed "s|IMAGE_PLACEHOLDER|${IMAGE_V2}|g" k8s/rolling-update/deployment.yaml | kubectl apply -f -
+          kubectl rollout status deployment/app-rolling --timeout=300s
+          T1=$(date +%s)
+          echo "Tiempo total rolling update: $((T1-T0))s"
+
+      - name: Recreate
+        if: ${{ github.event.inputs.strategy == 'recreate' }}
+        run: |
+          echo "=== Aplicando V1 (estado inicial) ==="
+          sed "s|IMAGE_PLACEHOLDER|${IMAGE_V1}|g" k8s/recreate/deployment.yaml | kubectl apply -f -
+          kubectl apply -f k8s/recreate/service.yaml
+          kubectl rollout status deployment/app-recreate --timeout=120s
+
+          echo "=== Recreate a V2 ==="
+          T0=$(date +%s)
+          sed "s|IMAGE_PLACEHOLDER|${IMAGE_V2}|g" k8s/recreate/deployment.yaml | kubectl apply -f -
+          kubectl rollout status deployment/app-recreate --timeout=300s
+          T1=$(date +%s)
+          echo "Tiempo total recreate: $((T1-T0))s"
+
+      - name: Blue-Green
+        if: ${{ github.event.inputs.strategy == 'blue-green' }}
+        run: |
+          echo "=== Desplegando BLUE (V1) ==="
+          sed "s|IMAGE_V1|${IMAGE_V1}|g" k8s/blue-green/blue.yaml | kubectl apply -f -
+          kubectl apply -f k8s/blue-green/service.yaml
+          kubectl rollout status deployment/app-blue --timeout=120s
+
+          echo "=== Desplegando GREEN (V2) en paralelo ==="
+          T0=$(date +%s)
+          sed "s|IMAGE_V2|${IMAGE_V2}|g" k8s/blue-green/green.yaml | kubectl apply -f -
+          kubectl rollout status deployment/app-green --timeout=300s
+          T1=$(date +%s)
+          echo "Tiempo de despliegue green: $((T1-T0))s"
+
+          echo "=== Esperando 120s antes del switch (prueba) ==="
+          sleep 120
+
+          echo "=== Switch atómico: blue -> green ==="
+          TS=$(date +%s%N)
+          kubectl patch service svc-bluegreen -p '{"spec":{"selector":{"app":"demo","version":"green"}}}'
+          TE=$(date +%s%N)
+          echo "Velocidad de switch: $(( (TE-TS)/1000000 ))ms"
+
+      - name: Canary
+        if: ${{ github.event.inputs.strategy == 'canary' }}
+        run: |
+          echo "=== Desplegando STABLE (V1, 9 réplicas) ==="
+          sed "s|IMAGE_V1|${IMAGE_V1}|g" k8s/canary/stable.yaml | kubectl apply -f -
+          kubectl apply -f k8s/canary/service.yaml
+          kubectl rollout status deployment/app-stable --timeout=120s
+
+          echo "=== Desplegando CANARY (V2, 1 réplica = 10%) ==="
+          T0=$(date +%s)
+          sed "s|IMAGE_V2|${IMAGE_V2}|g" k8s/canary/canary.yaml | kubectl apply -f -
+          kubectl rollout status deployment/app-canary --timeout=120s
+          T1=$(date +%s)
+          echo "Tiempo despliegue canary: $((T1-T0))s"
+
+          echo "=== Período de evaluación 60s ==="
+          sleep 60
+
+          echo "=== Promoción: stable a 0, canary a 10 ==="
+          TS=$(date +%s)
+          kubectl scale deployment/app-canary --replicas=10
+          kubectl scale deployment/app-stable --replicas=0
+          kubectl rollout status deployment/app-canary --timeout=300s
+          TE=$(date +%s)
+          echo "Velocidad de promoción: $((TE-TS))s"
+
+      - name: 5. Estado final del cluster
+        if: always()
+        run: |
+          echo "=== Deployments ==="
+          kubectl get deployments
+          echo "=== Pods ==="
+          kubectl get pods -o wide
+          echo "=== Services ==="
+          kubectl get services

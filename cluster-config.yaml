@@ -1,0 +1,36 @@
+apiVersion: eksctl.io/v1alpha5
+kind: ClusterConfig
+
+metadata:
+  name: duoc-eks-cluster-cli
+  region: us-east-1
+  version: "1.31"
+
+iam:
+  serviceRoleARN: arn:aws:iam::533267352641:role/LabRole
+
+vpc:
+  cidr: "10.42.0.0/16"
+  clusterEndpoints:
+    publicAccess: true
+    privateAccess: true
+
+managedNodeGroups:
+  - name: ng-default
+    instanceType: t3.medium
+    desiredCapacity: 2
+    minSize: 1
+    maxSize: 3
+    volumeSize: 20
+    amiFamily: AmazonLinux2023
+    iam:
+      instanceRoleARN: arn:aws:iam::533267352641:role/LabRole
+    labels:
+      role: worker
+    tags:
+      lab: auy1104-act2.4
+      managed-by: eksctl
+
+cloudWatch:
+  clusterLogging:
+    enableTypes: []
